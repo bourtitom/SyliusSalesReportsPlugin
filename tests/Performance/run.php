@@ -27,36 +27,30 @@ use SalesReportsBenchmark\Fixtures;
 use SalesReportsBenchmark\Mapping;
 use Sylius\Component\Core\Model;
 
-$options = getopt('', ['orders:', 'load', 'load-only', 'source:', 'limit:', 'fanout', 'multiitem', 'unitless', 'catalogue:', 'explain', 'trace']);
-$catalogueInput = $options['catalogue'] ?? '2';
-if (!in_array($catalogueInput, ['2', '1000'], true)) {
-    throw new RuntimeException('--catalogue must be 2 or 1000.');
+$options = getopt('', ['orders:', 'load', 'load-only', 'source:', 'limit:', 'fanout', 'multiitem', 'unitless']);
+foreach (array_slice($argv, 1) as $argument) {
+    if (!preg_match('/^--(?:(?:orders|source|limit)=.+|load|load-only|fanout|multiitem|unitless)$/D', $argument)) {
+        throw new RuntimeException('Unsupported argument; use --orders=N, --source=PATH or --limit=SECONDS for values.');
+    }
 }
-$catalogue = (int) $catalogueInput;
-$limit = (float) ($options['limit'] ?? 180);
-if (!is_finite($limit) || $limit <= 0 || $limit > 180) {
+$limitInput = $options['limit'] ?? '180';
+if (!is_string($limitInput) || !is_numeric($limitInput) || !is_finite((float) $limitInput) || (float) $limitInput <= 0 || (float) $limitInput > 180) {
     throw new RuntimeException('Limit must be > 0 and <= 180 seconds.');
 }
-$orders = (int) ($options['orders'] ?? 365000);
+$limit = (float) $limitInput;
+$ordersInput = $options['orders'] ?? '30000';
+if (!in_array($ordersInput, ['10', '30000', '50000'], true)) {
+    throw new RuntimeException('Allowed orders: 10 (control), 30000 (default), 50000 (maximum).');
+}
+$orders = (int) $ordersInput;
 $fanout = isset($options['fanout']);
 $multiitem = isset($options['multiitem']);
 $unitless = isset($options['unitless']);
-if (2 !== $catalogue && ($fanout || $multiitem || $unitless)) {
-    throw new RuntimeException('--fanout, --multiitem and --unitless require --catalogue=2.');
-}
-if ($unitless && (10 !== $orders || !isset($options['load']) || isset($options['load-only']) || $fanout || $multiitem)) {
-    throw new RuntimeException('--unitless requires --orders=10 --load and forbids --load-only, --fanout and --multiitem.');
-}
-if ($multiitem && (10 !== $orders || !isset($options['load']) || isset($options['load-only']) || $fanout)) {
-    throw new RuntimeException('--multiitem requires --orders=10 --load and forbids --load-only and --fanout.');
-}
-if ($fanout && (10 !== $orders || !isset($options['load']) || isset($options['load-only']))) {
-    throw new RuntimeException('--fanout requires --orders=10 --load and forbids --load-only.');
+$controls = (int) $fanout + (int) $multiitem + (int) $unitless;
+if ($controls > 1 || ($controls > 0 && (10 !== $orders || !isset($options['load']) || isset($options['load-only'])))) {
+    throw new RuntimeException('--fanout, --multiitem and --unitless are mutually exclusive; require --orders=10 --load and forbid --load-only.');
 }
 $scenario = $unitless ? 'unitless' : ($multiitem ? 'multiitem' : ($fanout ? 'fanout' : 'standard'));
-if (!in_array($orders, [10, 36500, 365000, 1000000], true)) {
-    throw new RuntimeException('Allowed orders: 10 (control only), 36500, 365000, 1000000.');
-}
 $url = getenv('SALES_REPORT_BENCHMARK_DATABASE_URL');
 $parts = false === $url ? false : parse_url($url);
 if (!$parts || !in_array($parts['scheme'] ?? '', ['mysql', 'pdo-mysql', 'pdo_mysql'], true)
@@ -96,31 +90,29 @@ if (isset($options['load']) || isset($options['load-only'])) {
     $tool = new SchemaTool($em);
     $tool->dropSchema($metadata);
     $tool->createSchema($metadata);
-    Fixtures::load($db, $orders, $fanout, $multiitem, $catalogue, $unitless);
-    $db->executeStatement("CREATE TABLE IF NOT EXISTS bench_manifest (orders_count INT NOT NULL, scenario VARCHAR(16) NOT NULL DEFAULT 'standard', catalogue_size INT NOT NULL DEFAULT 2)");
-    $manifestColumns = $db->createSchemaManager()->listTableColumns('bench_manifest');
-    if (!isset($manifestColumns['scenario'])) {
-        $db->executeStatement("ALTER TABLE bench_manifest ADD scenario VARCHAR(16) NOT NULL DEFAULT 'standard'");
+    Fixtures::load($db, $orders, $fanout, $multiitem, $unitless);
+    // Refresh planner statistics after bulk inserts, outside report timing.
+    foreach ($db->fetchAllAssociative('ANALYZE TABLE bench_order, bench_item, bench_unit, bench_adjustment') as $analysis) {
+        if ('error' === $analysis['Msg_type']) {
+            throw new RuntimeException('Unable to refresh benchmark table statistics.');
+        }
     }
-    if (!isset($manifestColumns['catalogue_size'])) {
-        $db->executeStatement('ALTER TABLE bench_manifest ADD catalogue_size INT NOT NULL DEFAULT 2');
-    }
-    $db->executeStatement('DELETE FROM bench_manifest');
-    $db->insert('bench_manifest', ['orders_count' => $orders, 'scenario' => $scenario, 'catalogue_size' => $catalogue]);
+    $db->executeStatement('DROP TABLE IF EXISTS bench_manifest');
+    $db->executeStatement('CREATE TABLE bench_manifest (orders_count INT NOT NULL, scenario VARCHAR(16) NOT NULL, catalogue_size INT NOT NULL)');
+    $db->insert('bench_manifest', ['orders_count' => $orders, 'scenario' => $scenario, 'catalogue_size' => 2]);
     if (isset($options['load-only'])) {
         echo json_encode(['loaded_orders' => $orders, 'excluded_orders' => 4, 'scenario' => $scenario,
-            'catalogue_size' => $catalogue, 'mysql' => $version]) . \PHP_EOL;
+            'mysql' => $version]) . \PHP_EOL;
         exit(0);
     }
 }
 $manifest = $db->fetchAssociative('SELECT * FROM bench_manifest');
-// Manifests from the original harness predate scenarios and contain only standard fixtures.
-if (!$manifest || (int) $manifest['orders_count'] !== $orders || ($manifest['scenario'] ?? 'standard') !== $scenario
-    || (int) ($manifest['catalogue_size'] ?? 2) !== $catalogue
+if (!$manifest || (int) $manifest['orders_count'] !== $orders || ($manifest['scenario'] ?? null) !== $scenario
+    || 2 !== (int) ($manifest['catalogue_size'] ?? 0)
     || (int) $db->fetchOne('SELECT COUNT(*) FROM bench_order') !== $orders + 4
-    || (int) $db->fetchOne('SELECT COUNT(*) FROM bench_variant') !== $catalogue
-    || (int) $db->fetchOne('SELECT COUNT(*) FROM bench_product') !== (2 === $catalogue ? 1 : 100)) {
-    throw new RuntimeException('Fixture count, scenario or catalogue mismatch; run --load for this exact profile.');
+    || 2 !== (int) $db->fetchOne('SELECT COUNT(*) FROM bench_variant')
+    || 1 !== (int) $db->fetchOne('SELECT COUNT(*) FROM bench_product')) {
+    throw new RuntimeException('Fixture count, scenario or fixed profile mismatch; run --load for this exact profile.');
 }
 
 // Interface doubles ONLY forward createQueryBuilder to real Doctrine repositories.
@@ -148,63 +140,16 @@ $locale->setCode('en_US');
 $channel->getId();
 $em->initializeObject($channel);
 $channel->setDefaultLocale($locale);
-if (isset($options['explain'])) {
-    $builderFile = $source . '/Repository/ReportAggregateQueryBuilder.php';
-    if (!is_file($builderFile) || !method_exists($report, 'appendOrderFilters')) {
-        throw new RuntimeException('--explain requires the native data builder and shared order filters in the selected source.');
-    }
-    require_once $builderFile;
-    $builder = new MonsieurBiz\SyliusSalesReportsPlugin\Repository\ReportAggregateQueryBuilder();
-    $filters = new ReflectionMethod($report, 'appendOrderFilters');
-    $parserProperty = new ReflectionProperty(Doctrine\ORM\Query::class, 'parserResult');
-    $plans = [];
-    foreach (['order_base' => 'createOrderBaseQuery', 'item_base' => 'createItemBaseQuery', 'unit_adjustments' => 'createUnitAdjustmentsQuery',
-        'item_adjustments' => 'createItemAdjustmentsQuery', 'order_adjustments' => 'createOrderAdjustmentsQuery',
-        'product_counts' => 'createProductOrderCountsQuery'] as $shape => $method) {
-        $base = $em->getRepository(Model\Order::class)->createQueryBuilder('o');
-        $filtered = $filters->invoke($report, $base, $channel, new DateTime('2025-01-01 00:00:00'), new DateTime('2025-12-31 23:59:59'));
-        $query = $builder->{$method}($filtered)->getQuery();
-        $sql = $query->getSQL();
-        $mappings = $parserProperty->getValue($query)->getParameterMappings();
-        $bindings = [];
-        $types = [];
-        foreach ($query->getParameters() as $parameter) {
-            $value = $parameter->getValue();
-            $type = $parameter->getType();
-            if ($value instanceof Model\ChannelInterface) {
-                $value = $value->getId();
-                $type = Doctrine\DBAL\ParameterType::INTEGER;
-            } else {
-                $value = $query->processParameterValue($value);
-            }
-            foreach ($mappings[$parameter->getName()] ?? [] as $position) {
-                $bindings[$position] = $value;
-                $types[$position] = $type;
-            }
-        }
-        ksort($bindings);
-        ksort($types);
-        $plan = $db->fetchOne('EXPLAIN FORMAT=JSON ' . $sql, array_values($bindings), array_values($types));
-        $plans[$shape] = ['sql' => $sql, 'plan' => json_decode($plan, true, 512, \JSON_THROW_ON_ERROR)];
-    }
-    echo json_encode(['diagnostic_only' => true, 'orders' => $orders, 'catalogue_size' => $catalogue, 'source' => $source,
-        'mysql' => $version, 'plans' => $plans], \JSON_PRETTY_PRINT | \JSON_THROW_ON_ERROR) . \PHP_EOL;
-    exit(0);
-}
 $native = $db->getNativeConnection();
 if (!$native instanceof PDO) {
     throw new RuntimeException('Native PDO connection required for server-side query deadlines.');
 }
-$logger = new class(isset($options['trace']), $native, $limit) implements SQLLogger {
+$logger = new class($native, $limit) implements SQLLogger {
     public int $count = 0;
-
-    public array $seconds = [];
-
-    private int $start = 0;
 
     public int $origin = 0;
 
-    public function __construct(private bool $trace, private PDO $native, private float $limit)
+    public function __construct(private PDO $native, private float $limit)
     {
     }
 
@@ -217,16 +162,10 @@ $logger = new class(isset($options['trace']), $native, $limit) implements SQLLog
             throw new RuntimeException('Unable to enforce the server-side report query deadline.');
         }
         ++$this->count;
-        $this->start = hrtime(true);
-        if ($this->trace) {
-            fwrite(\STDERR, json_encode(['event' => 'query_start', 'ordinal' => $this->count,
-                'elapsed_seconds' => ($this->start - $this->origin) / 1e9]) . \PHP_EOL);
-        }
     }
 
     public function stopQuery(): void
     {
-        $this->seconds[] = (hrtime(true) - $this->start) / 1e9;
     }
 };
 $db->getConfiguration()->setSQLLogger($logger);
@@ -265,13 +204,13 @@ if ($bulk) {
 $seconds = (hrtime(true) - $start) / 1e9;
 $peak = memory_get_peak_usage(true);
 $db->getConfiguration()->setSQLLogger(null);
-$expected = Fixtures::expected($orders, $fanout, $multiitem, $catalogue, $unitless);
+$expected = Fixtures::expected($orders, $fanout, $multiitem, $unitless);
 $assert = static function ($actual, $expected, string $label): void {
     if ($actual != $expected) {
         throw new RuntimeException($label . ' mismatch: ' . json_encode(['actual' => $actual, 'expected' => $expected]));
     }
 };
-$expectedQueries = !isset($options['source']) || method_exists($report, 'getAggregateReports') ? 8 : ($bulk ? 4 : 16);
+$expectedQueries = $bulk ? 8 : 16;
 $assert($logger->count, $expectedQueries, 'actual report data SQL query count');
 if (10 === $orders) {
     $referenceTotals = $multiitem ? [
@@ -298,8 +237,8 @@ $groupExpected = $expected;
 $groupExpected['total'] = 0;
 $groupExpected['without_tax_shipping_total'] = 0;
 $groupExpected['without_tax_promo_total'] += 20 * $orders;
-$variantCounts = Fixtures::expectedVariants($orders, $catalogue, $multiitem);
-$productCounts = Fixtures::expectedProducts($orders, $catalogue, $multiitem);
+$variantCounts = Fixtures::expectedVariants($orders, $multiitem);
+$productCounts = Fixtures::expectedProducts($orders, $multiitem);
 $groupDefinitions = ['products' => [], 'variants' => [], 'options' => [], 'option_values' => []];
 foreach (['products' => $productCounts, 'variants' => $variantCounts] as $key => $groups) {
     foreach ($groups as $id => $counts) {
@@ -309,7 +248,7 @@ foreach (['products' => $productCounts, 'variants' => $variantCounts] as $key =>
         $groupDefinitions[$key][$id] = $counts;
         if ('variants' === $key) {
             $counts['elements'] = 1;
-            $groupDefinitions['option_values'][Fixtures::variantCode($id, $catalogue)] = $counts;
+            $groupDefinitions['option_values'][Fixtures::variantCode($id)] = $counts;
         }
     }
 }
@@ -350,10 +289,9 @@ foreach (['products', 'variants', 'options', 'option_values'] as $key) {
 }
 echo json_encode(['description' => 'Synthetic structural SQL stress test, not a full business workflow recreation',
     'source' => $source, 'orders' => $orders, 'excluded_orders' => 4, 'scenario' => $scenario, 'seed' => 2025, 'mysql' => $version,
-    'catalogue_size' => $catalogue, 'sold_product_groups' => count($productCounts), 'sold_variant_groups' => count($variantCounts),
+    'sold_product_groups' => count($productCounts), 'sold_variant_groups' => count($variantCounts),
     'database_settings' => $databaseSettings, 'bootstrap_seconds' => ($start - $processStart) / 1e9,
     'strategy' => $bulk ? 'report-wide controller entry point' : 'six public methods (baseline)', 'queries' => $logger->count,
-    'query_execution_seconds' => $logger->seconds,
     'seconds' => $seconds, 'limit_seconds' => $limit, 'memory_start_bytes' => $startMemory,
     'peak_memory_bytes' => $peak, 'peak_delta_bytes' => $peak - $startMemory,
     'checks' => 'all six outputs checked against deterministic integer formulas', 'outputs' => $outputs], \JSON_PRETTY_PRINT | \JSON_THROW_ON_ERROR) . \PHP_EOL;

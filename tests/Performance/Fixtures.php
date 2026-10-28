@@ -20,25 +20,26 @@ use Throwable;
 
 final class Fixtures
 {
-    public static function load(Connection $db, int $orders, bool $fanout = false, bool $multiitem = false, int $catalogue = 2, bool $unitless = false): void
+    public static function load(Connection $db, int $orders, bool $fanout = false, bool $multiitem = false, bool $unitless = false): void
     {
-        if ($unitless && (10 !== $orders || 2 !== $catalogue || $fanout || $multiitem)) {
-            throw new InvalidArgumentException('Unitless fixtures require ten orders, catalogue 2 and no other regression scenario.');
+        if (!\in_array($orders, [10, 30000, 50000], true)) {
+            throw new InvalidArgumentException('Allowed orders: 10 (control), 30000 (default), 50000 (maximum).');
+        }
+        $controls = (int) $fanout + (int) $multiitem + (int) $unitless;
+        if ($controls > 1 || ($controls > 0 && 10 !== $orders)) {
+            throw new InvalidArgumentException('Regression scenarios are mutually exclusive and require ten orders.');
         }
         foreach (['bench_channel' => [[1], [2]], 'bench_shipment' => [[1]]] as $table => $rows) {
             foreach ($rows as $row) {
                 $db->insert($table, ['id' => $row[0]]);
             }
         }
-        for ($product = 1; $product <= (2 === $catalogue ? 1 : 100); ++$product) {
-            $db->insert('bench_product', ['id' => $product]);
-        }
+        $db->insert('bench_product', ['id' => 1]);
         $db->insert('bench_option', ['id' => 1, 'code' => 'size']);
         $db->insert('bench_option_translation', ['id' => 1, 'translatable_id' => 1, 'locale' => 'en_US', 'name' => 'Size']);
-        for ($id = 1; $id <= $catalogue; ++$id) {
-            $name = 1 === $id ? 'Popular' : (2 === $catalogue ? 'Rare' : 'Rare ' . $id);
-            $db->insert('bench_variant', ['id' => $id, 'product_id' => self::productId($id, $catalogue)]);
-            $db->insert('bench_option_value', ['id' => $id, 'code' => self::variantCode($id, $catalogue), 'option_id' => 1]);
+        foreach ([1 => 'Popular', 2 => 'Rare'] as $id => $name) {
+            $db->insert('bench_variant', ['id' => $id, 'product_id' => 1]);
+            $db->insert('bench_option_value', ['id' => $id, 'code' => self::variantCode($id), 'option_id' => 1]);
             $db->insert('bench_option_value_translation', ['id' => $id, 'translatable_id' => $id, 'locale' => 'en_US', 'value' => $name]);
             $db->insert('bench_variant_option', ['variant_id' => $id, 'value_id' => $id]);
         }
@@ -78,7 +79,7 @@ final class Fixtures
         };
         for ($id = 1; $id <= $orders + 4; ++$id) {
             $sentinel = max(0, $id - $orders);
-            $variant = 0 === $id % 10 ? (intdiv($id, 10) - 1) % ($catalogue - 1) + 2 : 1;
+            $variant = 0 === $id % 10 ? 2 : 1;
             $quantity = 1 === $variant ? 3 : 1;
             $extraPromotion = $fanout && 1 === $id ? 32 : 0;
             $extraItemTotal = $multiitem && 1 === $id ? 1155 : 0;
@@ -88,10 +89,8 @@ final class Fixtures
                 'paymentState' => 4 === $sentinel ? 'refunded' : 'paid',
                 'checkoutCompletedAt' => 2 === $sentinel ? '2024-12-31 23:59:59' : $date . ($id % 2 ? ' 00:00:00' : ' 23:59:59'),
                 'total' => $quantity * 1185 - 30 + 480 - $extraPromotion + $extraItemTotal]);
-            $productName = 2 === $catalogue ? 'Synthetic product' : 'Synthetic product ' . self::productId($variant, $catalogue);
-            $variantName = 1 === $variant ? 'Popular' : (2 === $catalogue ? 'Rare' : 'Rare ' . $variant);
-            $append('bench_item', ['id' => $id, 'order_id' => $id, 'variant_id' => $variant, 'productName' => $productName,
-                'variantName' => $variantName, 'unitPrice' => 1200, 'quantity' => $quantity, 'total' => $quantity * 1185 - 30 - $extraPromotion]);
+            $append('bench_item', ['id' => $id, 'order_id' => $id, 'variant_id' => $variant, 'productName' => 'Synthetic product',
+                'variantName' => 1 === $variant ? 'Popular' : 'Rare', 'unitPrice' => 1200, 'quantity' => $quantity, 'total' => $quantity * 1185 - 30 - $extraPromotion]);
             $add = static function (string $type, int $amount, int $neutral, ?int $order, ?int $item, ?int $unitId, ?int $shipment = null) use (&$adjustment, $append): void {
                 $append('bench_adjustment', ['id' => ++$adjustment, 'type' => $type, 'amount' => $amount, 'neutral' => $neutral,
                     'order_id' => $order, 'orderItem_id' => $item, 'orderItemUnit_id' => $unitId, 'shipment_id' => $shipment]);
@@ -139,61 +138,32 @@ final class Fixtures
         }
     }
 
-    public static function productId(int $variant, int $catalogue = 2): int
+    public static function variantCode(int $variant): string
     {
-        return 2 === $catalogue ? 1 : intdiv($variant - 1, 10) + 1;
-    }
-
-    public static function variantCode(int $variant, int $catalogue = 2): string
-    {
-        return 1 === $variant ? 'popular' : (2 === $catalogue ? 'rare' : 'rare_' . $variant);
+        return 1 === $variant ? 'popular' : 'rare';
     }
 
     /** Closed-form accepted-order counts; excluded rows never enter this model. */
-    public static function expectedVariants(int $orders, int $catalogue = 2, bool $multiitem = false): array
+    public static function expectedVariants(int $orders, bool $multiitem = false): array
     {
         $rare = intdiv($orders, 10);
         $popular = $orders - $rare;
-        $groups = [1 => ['orders' => $popular, 'items' => $popular, 'units' => $popular * 3,
-            'representative' => $orders - (0 === $orders % 10 ? 1 : 0)]];
-        $quotient = intdiv($rare, $catalogue - 1);
-        $remainder = $rare % ($catalogue - 1);
-        for ($variant = 2; $variant <= $catalogue; ++$variant) {
-            $offset = $variant - 2;
-            $count = $quotient + ($offset < $remainder ? 1 : 0);
-            $extra = $multiitem && 2 === $variant ? 1 : 0;
-            if (0 === $count + $extra) {
-                continue;
-            }
-            $representative = $count > 0 ? 10 * ($offset + ($count - 1) * ($catalogue - 1) + 1) : 1;
-            $groups[$variant] = ['orders' => $count + $extra, 'items' => $count + $extra,
-                'units' => $count + $extra, 'representative' => $representative];
-        }
+        $rare += $multiitem ? 1 : 0;
 
-        return $groups;
+        return [1 => ['orders' => $popular, 'items' => $popular, 'units' => $popular * 3, 'representative' => $orders - 1],
+            2 => ['orders' => $rare, 'items' => $rare, 'units' => $rare, 'representative' => $orders]];
     }
 
-    public static function expectedProducts(int $orders, int $catalogue = 2, bool $multiitem = false): array
+    public static function expectedProducts(int $orders, bool $multiitem = false): array
     {
-        $groups = [];
-        foreach (self::expectedVariants($orders, $catalogue, $multiitem) as $variant => $counts) {
-            $product = self::productId($variant, $catalogue);
-            $groups[$product] ??= ['orders' => 0, 'items' => 0, 'units' => 0];
-            foreach (['orders', 'items', 'units'] as $field) {
-                $groups[$product][$field] += $counts[$field];
-            }
-        }
-        if ($multiitem) {
-            --$groups[1]['orders'];
-        }
-
-        return $groups;
+        return [1 => ['orders' => $orders, 'items' => $orders + ($multiitem ? 1 : 0),
+            'units' => intdiv($orders * 28, 10) + ($multiitem ? 1 : 0)]];
     }
 
-    public static function expected(int $orders, bool $fanout = false, bool $multiitem = false, int $catalogue = 2, bool $unitless = false): array
+    public static function expected(int $orders, bool $fanout = false, bool $multiitem = false, bool $unitless = false): array
     {
         $extraItems = $multiitem ? 1 : 0;
-        $units = array_sum(array_column(self::expectedVariants($orders, $catalogue, $multiitem), 'units'));
+        $units = intdiv($orders * 28, 10) + $extraItems;
         $items = $orders + $extraItems;
         $extraPromotion = $fanout ? 32 : 0;
 

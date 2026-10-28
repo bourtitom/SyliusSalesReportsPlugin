@@ -4,10 +4,10 @@ services:
         command:
             - --default-authentication-plugin=mysql_native_password
             - --skip-log-bin
-            - --innodb-buffer-pool-size=2147483648
+            - --innodb-buffer-pool-size=536870912
             - --innodb-buffer-pool-instances=1
-            - --tmp-table-size=67108864
-            - --max-heap-table-size=67108864
+            - --tmp-table-size=16777216
+            - --max-heap-table-size=16777216
         ports:
             - "127.0.0.1::3306"
         environment:
@@ -15,7 +15,7 @@ services:
             MYSQL_DATABASE: sales_reports_benchmark
         volumes:
             - database:/var/lib/mysql
-        mem_limit: 3g
+        mem_limit: 1g
         healthcheck:
             test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "--silent"]
             interval: 2s
