@@ -1,0 +1,79 @@
+{
+    "ticket": "MBIZ-29009",
+    "measured_date": "2026-10-28",
+    "scope": "Synthetic annual structural SQL stress; not HTTP or full Sylius workflows",
+    "baseline_commit": "c3fa1a5273dff16f401e08efa436f18d38b8e99c",
+    "versions": {
+        "php": "8.2.29",
+        "mysql": "8.0.46",
+        "sylius_core": "1.14.21",
+        "doctrine_orm": "2.20.13",
+        "doctrine_dbal": "3.10.6"
+    },
+    "final_profile": {
+        "docker_vm_cpus": 6,
+        "docker_vm_memory_gib_approx": 32,
+        "mysql_container_limit_bytes": 3221225472,
+        "actual_buffer_pool_bytes": 2147483648,
+        "buffer_pool_instances": 1,
+        "temp_table_bytes": 67108864,
+        "heap_table_bytes": 67108864,
+        "binary_logging": false,
+        "php_memory_limit_bytes": 2147483648,
+        "report_limit_seconds": 180,
+        "external_watchdog_seconds": 185,
+        "cache_state": "Not controlled; separate PHP processes on a shared Docker VM"
+    },
+    "largest_complete_dataset": {
+        "accepted_orders": 1000000,
+        "excluded_orders": 4,
+        "actual_orders": 1000004,
+        "actual_items": 1000004,
+        "actual_units": 2800012,
+        "actual_adjustments": 12400052,
+        "actual_products": 100,
+        "actual_variants": 1000,
+        "year": 2025
+    },
+    "final_profile_runs": [
+        {"orders": 365000, "catalogue": 2, "seconds": 31.60607025, "queries": 8, "peak_php_bytes": 12582912, "six_outputs_and_group_formulas": "PASS"},
+        {"orders": 1000000, "catalogue": 1000, "repeat": 1, "seconds": 151.084807833, "queries": 8, "peak_php_bytes": 18874368, "six_outputs_and_group_formulas": "PASS"},
+        {"orders": 1000000, "catalogue": 1000, "repeat": 2, "seconds": 125.91545475, "queries": 8, "peak_php_bytes": 18874368, "six_outputs_and_group_formulas": "PASS"},
+        {"orders": 1000000, "catalogue": 1000, "repeat": 3, "seconds": 105.645155458, "queries": 8, "peak_php_bytes": 18874368, "six_outputs_and_group_formulas": "PASS"}
+    ],
+    "same_final_profile_baseline": [
+        {"orders": 365000, "catalogue": 2, "result": "FAIL", "reason": "External watchdog exceeded 185 seconds", "completed_seconds": null},
+        {"orders": 1000000, "catalogue": 1000, "result": "FAIL", "reason": "PHP exhausted 2147483648 bytes in Doctrine ArrayHydrator.php:213", "completed_seconds": null}
+    ],
+    "smaller_profile_observations": {
+        "mysql_container_limit_bytes": 2147483648,
+        "actual_buffer_pool_bytes": 1610612736,
+        "temp_and_heap_bytes": 67108864,
+        "orders_365000_seconds": [48.659488666, 22.333871208],
+        "orders_1000000_catalogue1000_results": ["FAIL: 180-second SQL budget", "PASS: 149.053988916 seconds with trace"],
+        "conclusion": "The smaller profile does not reliably meet the million-order budget"
+    },
+    "financial_controls": {
+        "standard": "PASS: all six outputs",
+        "repeated_adjustments": "PASS: all six outputs; equal amounts count separately",
+        "multiple_items": "PASS: 10 distinct product orders versus 9 plus 2 variant orders",
+        "unitless_item": "PASS: current eight-query and original sixteen-query sources",
+        "enabled_sql_filter": "PASS: real MySQL; four-query fallback; all six outputs equal filtered legacy methods"
+    },
+    "quality": {
+        "unit_tests": 30,
+        "unit_assertions": 344,
+        "phpstan": "PASS",
+        "phpmd": "PASS: zero violations",
+        "coding_standards": "PASS",
+        "full_suite": "BLOCKED: ignored local root lock contains Sylius 2.2.2 against the 1.x constraint"
+    },
+    "limits": [
+        "No production or staging access",
+        "No HTTP or full application/container verification",
+        "No non-MySQL runtime verification",
+        "Custom overrides and enabled SQL filters retain compatibility paths, not the eight-query performance guarantee",
+        "A smaller memory profile had a failed million-order run; no universal latency guarantee",
+        "One initial catalogue load failed because the shared Docker disk was full; it was reloaded completely after user-authorized cache cleanup"
+    ]
+}
