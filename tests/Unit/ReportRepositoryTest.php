@@ -15,12 +15,19 @@ namespace MonsieurBiz\SyliusSalesReportsPlugin\Tests\Unit;
 
 use DateTimeImmutable;
 use DateTimeInterface;
+use Doctrine\DBAL\Connection;
+use Doctrine\DBAL\Platforms\AbstractPlatform;
+use Doctrine\DBAL\Platforms\MariaDBPlatform;
+use Doctrine\DBAL\Platforms\MySQLPlatform;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
+use Doctrine\DBAL\Platforms\SqlitePlatform;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Mapping\ClassMetadata;
 use Doctrine\ORM\Query;
 use Doctrine\ORM\Query\Filter\SQLFilter;
 use Doctrine\ORM\Query\FilterCollection;
 use Doctrine\ORM\QueryBuilder;
+use LogicException;
 use MonsieurBiz\SyliusSalesReportsPlugin\Exception\MissingLocaleException;
 use MonsieurBiz\SyliusSalesReportsPlugin\Repository\AbstractReportRepository;
 use MonsieurBiz\SyliusSalesReportsPlugin\Repository\ReportRepository;
@@ -28,6 +35,7 @@ use MonsieurBiz\SyliusSalesReportsPlugin\Repository\ReportSummaryAssembler;
 use PHPUnit\Framework\TestCase;
 use ReflectionClass;
 use ReflectionMethod;
+use RuntimeException;
 use Sylius\Component\Core\Model\ChannelInterface;
 use Sylius\Component\Core\Model\Order;
 use Sylius\Component\Core\Model\OrderItem;
@@ -35,9 +43,204 @@ use Sylius\Component\Core\Model\OrderItemUnit;
 use Sylius\Component\Core\Repository\OrderRepositoryInterface;
 use Sylius\Component\Core\Repository\ProductVariantRepositoryInterface;
 use Sylius\Component\Locale\Model\LocaleInterface;
+use Throwable;
 
 final class ReportRepositoryTest extends TestCase
 {
+    /**
+     * @dataProvider snapshotPlatforms
+     */
+    public function testSnapshotIncludesAllEightReadsAndOptions(AbstractPlatform $platform, array $start): void
+    {
+        $events = [];
+        $connection = $this->snapshotConnection($platform, $events);
+        $repository = $this->nativeRepository($this->snapshotSummaries(), [], [], $connection, static function () use (&$events): void {
+            $events[] = 'read';
+        });
+        $repository->getReportsForChannelForDates($this->channel('fr_FR'), new DateTimeImmutable('2025-01-01'));
+        self::assertSame(array_merge($start, array_fill(0, 8, 'read'), ['commit']), $events);
+    }
+
+    public static function snapshotPlatforms(): iterable
+    {
+        yield 'mysql' => [new MySQLPlatform(), ['set', 'begin']];
+        yield 'mariadb' => [new MariaDBPlatform(), ['set', 'begin']];
+        yield 'postgresql' => [new PostgreSQLPlatform(), ['begin', 'set']];
+    }
+
+    public function testEmptySnapshotCommitsAfterLocaleCheck(): void
+    {
+        $events = [];
+        $connection = $this->snapshotConnection(new MySQLPlatform(), $events);
+        $repository = $this->nativeRepository([[['total' => null, 'order_count' => '0']]], [], [], $connection, static function () use (&$events): void {
+            $events[] = 'read';
+        });
+        $repository->getReportsForChannelForDates($this->channel('fr_FR'), new DateTimeImmutable('2025-01-01'));
+        self::assertSame(['set', 'begin', 'read', 'commit'], $events);
+    }
+
+    /**
+     * @dataProvider snapshotFailures
+     */
+    public function testSnapshotFailuresPreserveOriginalErrorAndClose(string $failure, bool $rollbackFails, AbstractPlatform $platform): void
+    {
+        $events = [];
+        $error = new RuntimeException('Original failure');
+        $connection = $this->snapshotConnection($platform, $events, $failure, $error, $rollbackFails);
+        $summaries = $this->snapshotSummaries();
+        $channel = $this->channel('fr_FR');
+        if ('aggregate' === $failure || 'close' === $failure) {
+            $summaries = [$error];
+        } elseif ('options' === $failure) {
+            $summaries[7] = $error;
+        } elseif ('locale' === $failure) {
+            $summaries = [[['total' => null, 'order_count' => '0']]];
+            $channel = $this->createMock(ChannelInterface::class);
+        } else {
+            $summaries = [];
+            if ('commit' === $failure || 'commit_inactive' === $failure) {
+                $summaries = [[['total' => null, 'order_count' => '0']]];
+            }
+        }
+        $repository = $this->nativeRepository($summaries, [], [], $connection);
+
+        try {
+            $repository->getReportsForChannelForDates($channel, new DateTimeImmutable('2025-01-01'));
+            self::fail('A failed snapshot must not return reports.');
+        } catch (Throwable $actual) {
+            if ('locale' === $failure) {
+                self::assertInstanceOf(MissingLocaleException::class, $actual);
+            } else {
+                self::assertSame($error, $actual);
+            }
+        }
+        self::assertSame('close', end($events));
+        $rollbackExpected = 'commit_inactive' !== $failure && ('set' !== $failure || $platform instanceof PostgreSQLPlatform);
+        self::assertSame($rollbackExpected, \in_array('rollback', $events, true));
+        self::assertSame(\in_array($failure, ['commit', 'commit_inactive'], true), \in_array('commit', $events, true));
+    }
+
+    public static function snapshotFailures(): iterable
+    {
+        foreach (['set', 'begin', 'aggregate', 'options', 'locale', 'commit', 'commit_inactive', 'close'] as $failure) {
+            yield $failure => [$failure, false, new MySQLPlatform()];
+        }
+        yield 'rollback failure' => ['aggregate', true, new MySQLPlatform()];
+        yield 'postgresql set failure' => ['set', false, new PostgreSQLPlatform()];
+        yield 'postgresql begin failure' => ['begin', false, new PostgreSQLPlatform()];
+    }
+
+    /**
+     * @dataProvider snapshotRejections
+     */
+    public function testSnapshotRejectsCallerStateWithoutMutatingConnections(int $depth, bool $autoCommit, AbstractPlatform $platform, bool $differentConnection): void
+    {
+        $connection = $this->createMock(Connection::class);
+        $connection->method('isTransactionActive')->willReturn($depth > 0);
+        $connection->method('isAutoCommit')->willReturn($autoCommit);
+        $connection->method('getDatabasePlatform')->willReturn($platform);
+        $connection->expects(self::never())->method('getTransactionIsolation');
+        $connection->expects(self::never())->method('setTransactionIsolation');
+        foreach (['executeStatement', 'beginTransaction', 'commit', 'rollBack', 'close'] as $method) {
+            $connection->expects(self::never())->method($method);
+        }
+        $variantConnection = null;
+        if ($differentConnection) {
+            $variantConnection = $this->createMock(Connection::class);
+            foreach (['executeStatement', 'beginTransaction', 'commit', 'rollBack', 'close'] as $method) {
+                $variantConnection->expects(self::never())->method($method);
+            }
+        }
+        $repository = $this->nativeRepository([], [], [], $connection, null, $variantConnection);
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('Native report');
+        $repository->getReportsForChannelForDates($this->channel('fr_FR'), new DateTimeImmutable('2025-01-01'));
+    }
+
+    public static function snapshotRejections(): iterable
+    {
+        yield 'caller transaction' => [1, true, new MySQLPlatform(), false];
+        yield 'nested caller transaction' => [2, true, new MySQLPlatform(), false];
+        yield 'lazy non-autocommit' => [0, false, new MySQLPlatform(), false];
+        yield 'unsupported platform' => [0, true, new SqlitePlatform(), false];
+        yield 'different variant connection' => [0, true, new MySQLPlatform(), true];
+    }
+
+    private function snapshotConnection(AbstractPlatform $platform, array &$events, string $failure = '', ?RuntimeException $error = null, bool $rollbackFails = false): Connection
+    {
+        $active = false;
+        $connection = $this->createMock(Connection::class);
+        $connection->method('getDatabasePlatform')->willReturn($platform);
+        $connection->method('isAutoCommit')->willReturn(true);
+        $connection->method('isTransactionActive')->willReturnCallback(static function () use (&$active) { return $active; });
+        $connection->expects(self::never())->method('getTransactionIsolation');
+        $connection->expects(self::never())->method('setTransactionIsolation');
+        $connection->method('executeStatement')->with('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')->willReturnCallback(static function () use (&$events, $failure, $error) {
+            $events[] = 'set';
+            if ('set' === $failure) {
+                throw $error;
+            }
+
+            return 0;
+        });
+        $connection->method('beginTransaction')->willReturnCallback(static function () use (&$events, &$active, $failure, $error) {
+            $events[] = 'begin';
+            $active = true;
+            if ('begin' === $failure) {
+                throw $error;
+            }
+
+            return true;
+        });
+        $connection->method('commit')->willReturnCallback(static function () use (&$events, &$active, $failure, $error) {
+            $events[] = 'commit';
+            if ('commit_inactive' === $failure) {
+                $active = false;
+
+                throw $error;
+            }
+            if ('commit' === $failure) {
+                throw $error;
+            }
+            $active = false;
+
+            return true;
+        });
+        $connection->method('rollBack')->willReturnCallback(static function () use (&$events, &$active, $rollbackFails) {
+            $events[] = 'rollback';
+            if ($rollbackFails) {
+                throw new RuntimeException('Rollback failed');
+            }
+            $active = false;
+
+            return true;
+        });
+        $connection->method('close')->willReturnCallback(static function () use (&$events, $failure): void {
+            $events[] = 'close';
+            if ('close' === $failure) {
+                throw new RuntimeException('Close failed');
+            }
+        });
+
+        return $connection;
+    }
+
+    private function snapshotSummaries(): array
+    {
+        $group = ['product_id' => 1, 'variant_id' => 11];
+
+        return [
+            [['total' => '100', 'order_count' => '1']],
+            [$group + ['without_tax' => '100', 'item_row' => '100', 'item_qty' => '1', 'order_count' => '1', 'order_id' => '1', 'latest_item_id' => '1']],
+            [],
+            [],
+            [[]],
+            [['product_id' => 1, 'order_count' => '1']],
+            [$group + ['item_id' => 1, 'order_id' => 1, 'product_name' => 'Product', 'variant_name' => 'Variant']],
+            [['variant_id' => 11, 'option_code' => 'color', 'option_label' => 'Color', 'option_value_code' => 'red', 'option_value_label' => 'Red']],
+        ];
+    }
+
     public function testNativePipelineReadsEightSmallSummariesAndKeepsOptionRepresentativeCounts(): void
     {
         $group = ['product_id' => 1, 'variant_id' => 11];
@@ -491,9 +694,15 @@ final class ReportRepositoryTest extends TestCase
         self::assertSame([], $repository->options([]));
     }
 
-    private function nativeRepository(array $summaries, array $enabledFilters = [], array $expectedQueryPaths = []): ReportRepository
+    private function nativeRepository(array $summaries, array $enabledFilters = [], array $expectedQueryPaths = [], ?Connection $connection = null, ?callable $onRead = null, ?Connection $variantConnection = null): ReportRepository
     {
+        if (null === $connection) {
+            $connection = $this->createMock(Connection::class);
+            $connection->method('getDatabasePlatform')->willReturn(new MySQLPlatform());
+            $connection->method('isAutoCommit')->willReturn(true);
+        }
         $manager = $this->createMock(EntityManagerInterface::class);
+        $manager->method('getConnection')->willReturn($connection);
         $filters = $this->createMock(FilterCollection::class);
         $filters->method('getEnabledFilters')->willReturn($enabledFilters);
         $manager->method('getFilters')->willReturn($filters);
@@ -506,7 +715,7 @@ final class ReportRepositoryTest extends TestCase
             $metadata->mapOneToMany(['fieldName' => 'adjustments', 'targetEntity' => 'Custom\\Adjustment', 'mappedBy' => $owner]);
         }
         $manager->method('getClassMetadata')->willReturnMap([[Order::class, $orderMetadata], [OrderItem::class, $itemMetadata], [OrderItemUnit::class, $unitMetadata]]);
-        $manager->expects(self::exactly(\count($summaries)))->method('createQuery')->willReturnCallback(function (string $dql) use (&$summaries, &$expectedQueryPaths) {
+        $manager->expects(self::exactly(\count($summaries)))->method('createQuery')->willReturnCallback(function (string $dql) use (&$summaries, &$expectedQueryPaths, $onRead) {
             if ([] !== $expectedQueryPaths) {
                 self::assertStringContainsString(array_shift($expectedQueryPaths), $dql);
                 self::assertStringNotContainsString('SIZE(', $dql);
@@ -520,14 +729,29 @@ final class ReportRepositoryTest extends TestCase
             $query->method('setParameters')->willReturnSelf();
             $query->method('setFirstResult')->willReturnSelf();
             $query->method('setMaxResults')->willReturnSelf();
-            $query->expects(self::once())->method('getArrayResult')->willReturn(array_shift($summaries));
+            $summary = array_shift($summaries);
+            $query->expects(self::once())->method('getArrayResult')->willReturnCallback(static function () use ($summary, $onRead) {
+                if (null !== $onRead) {
+                    $onRead();
+                }
+                if ($summary instanceof Throwable) {
+                    throw $summary;
+                }
+
+                return $summary;
+            });
 
             return $query;
         });
         $orders = $this->getMockBuilder(OrderRepositoryInterface::class)->onlyMethods(get_class_methods(OrderRepositoryInterface::class))->addMethods(['createQueryBuilder'])->getMock();
         $orders->method('createQueryBuilder')->willReturnCallback(static fn (string $alias) => (new QueryBuilder($manager))->from(Order::class, $alias));
         $variants = $this->getMockBuilder(ProductVariantRepositoryInterface::class)->onlyMethods(get_class_methods(ProductVariantRepositoryInterface::class))->addMethods(['createQueryBuilder'])->getMock();
-        $variants->method('createQueryBuilder')->willReturnCallback(static fn (string $alias) => (new QueryBuilder($manager))->from('Custom\\Variant', $alias));
+        $variantManager = $manager;
+        if (null !== $variantConnection) {
+            $variantManager = $this->createMock(EntityManagerInterface::class);
+            $variantManager->method('getConnection')->willReturn($variantConnection);
+        }
+        $variants->method('createQueryBuilder')->willReturnCallback(static fn (string $alias) => (new QueryBuilder($variantManager))->from('Custom\\Variant', $alias));
 
         return new ReportRepository($orders, $variants, null, null);
     }

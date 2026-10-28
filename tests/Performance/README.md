@@ -40,11 +40,20 @@ Loading, table-statistics refresh, proxy initialization and assertions are outsi
 report measurement. Fresh statistics avoid poor plans after bulk fixture inserts.
 The report ceiling is 180 seconds (`--limit` may only lower it); each query receives
 the remaining SQL deadline. The external 185-second watchdog also bounds PHP work.
-The native entry point must use 8 data queries. Optional `--source=/absolute/baseline/src`
+The aggregate entry point uses 8 data queries plus 3 transaction-control statements.
+The full call, including transaction overhead, remains inside report timing.
+Benchmark-only deadline SETs are not included in these query counts.
+Optional `--source=/absolute/baseline/src`
 runs original baseline public methods (16 queries) in a separate process on the same
 data. Cache state is uncontrolled; use PHP 8.2+ and identical limits for comparisons.
 The isolated Flysystem advisory exception is for local CLI only (no HTTP/uploads),
 not a production dependency policy.
+
+The aggregate path reads one repeatable-read snapshot, including options, on
+MySQL/MariaDB or PostgreSQL. It requires the same order/options connection,
+autocommit enabled and no caller-owned transaction; other cases fail explicitly.
+Isolation applies to this transaction only, without changing session defaults.
+Legacy customization paths keep their existing transaction behavior.
 
 ## Deterministic data and correctness controls
 

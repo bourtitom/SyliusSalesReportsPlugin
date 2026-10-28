@@ -15,18 +15,25 @@ namespace MonsieurBiz\SyliusSalesReportsPlugin\Repository;
 
 use DateTime;
 use DateTimeInterface;
+use Doctrine\DBAL\Connection;
+use Doctrine\DBAL\Platforms\MySQLPlatform;
+use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Exception;
+use LogicException;
 use MonsieurBiz\SyliusSalesReportsPlugin\Exception\InvalidDateException;
 use MonsieurBiz\SyliusSalesReportsPlugin\Exception\MissingLocaleException;
 use ReflectionClass;
 use ReflectionMethod;
 use Sylius\Component\Core\Model\ChannelInterface;
+use Throwable;
 
 class ReportRepository extends AbstractReportRepository
 {
     /**
      * Generate the built-in reports from one set of sales data, without caching it between calls.
      * Public per-report and protected transformation overrides retain the legacy execution path.
+     * Native aggregation requires its own autocommit connection with no existing transaction,
+     * on MySQL/MariaDB or PostgreSQL, shared by the order and variant repositories.
      *
      * @throws InvalidDateException
      * @throws MissingLocaleException
@@ -57,11 +64,78 @@ class ReportRepository extends AbstractReportRepository
             throw new InvalidDateException('Invalid date given to report.');
         }
 
-        $reports = $this->canAggregateReports()
-            ? $this->getAggregateReports($channel, $fromDate, $toDate)
-            : $this->getArrayReports($channel, $fromDate, $toDate);
+        if ($this->canAggregateReports()) {
+            return $this->getSnapshotReports($channel, $fromDate, $toDate);
+        }
 
-        return $this->addOptionReports($reports, $channel);
+        return $this->addOptionReports($this->getArrayReports($channel, $fromDate, $toDate), $channel);
+    }
+
+    private function getSnapshotReports(ChannelInterface $channel, DateTimeInterface $fromDate, DateTimeInterface $toDate): array
+    {
+        $connection = $this->getSnapshotConnection();
+
+        try {
+            // MySQL applies this to the next transaction; PostgreSQL applies it to the current one.
+            switch (true) {
+                case $connection->getDatabasePlatform() instanceof PostgreSQLPlatform:
+                    $connection->beginTransaction();
+                    $connection->executeStatement('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+
+                    break;
+                default:
+                    $connection->executeStatement('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+                    $connection->beginTransaction();
+            }
+            $reports = $this->addOptionReports($this->getAggregateReports($channel, $fromDate, $toDate), $channel);
+            $connection->commit();
+
+            return $reports;
+        } catch (Throwable $error) {
+            $this->discardSnapshot($connection);
+
+            throw $error;
+        }
+    }
+
+    private function getSnapshotConnection(): Connection
+    {
+        $connection = $this->createOrderQuery()->getEntityManager()->getConnection();
+        if ($connection->isTransactionActive() || !$connection->isAutoCommit()) {
+            throw new LogicException('Native reports must own their snapshot: autocommit is required and no transaction may be active.');
+        }
+        $this->validateSnapshotPlatform($connection);
+        if ($connection !== $this->createProductVariantQuery()->getEntityManager()->getConnection()) {
+            throw new LogicException('Native report snapshots require the same connection for orders and product variants.');
+        }
+
+        return $connection;
+    }
+
+    private function validateSnapshotPlatform(Connection $connection): void
+    {
+        $platform = $connection->getDatabasePlatform();
+        if (!$platform instanceof MySQLPlatform && !$platform instanceof PostgreSQLPlatform) {
+            throw new LogicException('Native report snapshots support only MySQL/MariaDB and PostgreSQL.');
+        }
+    }
+
+    private function discardSnapshot(Connection $connection): void
+    {
+        try {
+            if ($connection->isTransactionActive()) {
+                $connection->rollBack();
+            }
+        } catch (Throwable $cleanupError) {
+            // Preserve the original error even if the driver cannot roll back.
+        }
+
+        try {
+            // Failed commits can leave uncertain driver state even when DBAL reports depth zero.
+            $connection->close();
+        } catch (Throwable $cleanupError) {
+            // Cleanup must never replace the original error.
+        }
     }
 
     private function addOptionReports(array $reports, ChannelInterface $channel): array

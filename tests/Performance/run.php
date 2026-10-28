@@ -147,6 +147,8 @@ if (!$native instanceof PDO) {
 $logger = new class($native, $limit) implements SQLLogger {
     public int $count = 0;
 
+    public int $controlStatements = 0;
+
     public int $origin = 0;
 
     public function __construct(private PDO $native, private float $limit)
@@ -155,6 +157,11 @@ $logger = new class($native, $limit) implements SQLLogger {
 
     public function startQuery($sql, ?array $params = null, ?array $types = null): void
     {
+        if (1 !== preg_match('/^SELECT\b/i', ltrim($sql))) {
+            ++$this->controlStatements;
+
+            return;
+        }
         $deadline = $this->origin + (int) ($this->limit * 1e9);
         $remaining = (int) max(1, floor(($deadline - hrtime(true)) / 1e6));
         // Native PDO avoids recursively invoking this DBAL report-query logger.
@@ -212,6 +219,7 @@ $assert = static function ($actual, $expected, string $label): void {
 };
 $expectedQueries = $bulk ? 8 : 16;
 $assert($logger->count, $expectedQueries, 'actual report data SQL query count');
+$assert($logger->controlStatements, $bulk ? 3 : 0, 'snapshot control statement count');
 if (10 === $orders) {
     $referenceTotals = $multiitem ? [
         'without_tax_total' => 29000, 'without_tax_promo_total' => -965,
@@ -292,6 +300,7 @@ echo json_encode(['description' => 'Synthetic structural SQL stress test, not a 
     'sold_product_groups' => count($productCounts), 'sold_variant_groups' => count($variantCounts),
     'database_settings' => $databaseSettings, 'bootstrap_seconds' => ($start - $processStart) / 1e9,
     'strategy' => $bulk ? 'report-wide controller entry point' : 'six public methods (baseline)', 'queries' => $logger->count,
+    'transaction_control_statements' => $logger->controlStatements,
     'seconds' => $seconds, 'limit_seconds' => $limit, 'memory_start_bytes' => $startMemory,
     'peak_memory_bytes' => $peak, 'peak_delta_bytes' => $peak - $startMemory,
     'checks' => 'all six outputs checked against deterministic integer formulas', 'outputs' => $outputs], \JSON_PRETTY_PRINT | \JSON_THROW_ON_ERROR) . \PHP_EOL;
