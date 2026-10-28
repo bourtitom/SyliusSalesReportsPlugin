@@ -320,7 +320,8 @@ abstract class AbstractReportRepository
      */
     protected function getVariantsOptions(string $localeCode): array
     {
-        if (empty($this->results)) {
+        $variantIds = array_values(array_filter(array_keys($this->results), static fn ($variantId): bool => '' !== $variantId));
+        if ([] === $variantIds) {
             return [];
         }
 
@@ -337,7 +338,7 @@ abstract class AbstractReportRepository
             ->leftJoin('option.translations', 'option_translation', 'WITH', 'option_translation.locale = :locale')
             ->setParameter('locale', $localeCode)
             ->andWhere('v.id IN (:variant_ids)')
-            ->setParameter('variant_ids', array_keys($this->results))
+            ->setParameter('variant_ids', $variantIds)
         ;
 
         $variantOptionsValues = [];
